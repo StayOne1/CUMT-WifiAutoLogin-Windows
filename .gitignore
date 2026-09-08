@@ -1,0 +1,41 @@
+# ── PyInstaller 打包产物 ──────────────────────
+build/
+dist/
+*.spec.bak
+
+# ── Windows 原版文件（不提交）────────────────
+_internal/
+CUMT-Campus-Login.exe
+*.exe
+*.dll
+*.pyd
+
+# ── Python 缓存 ───────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── macOS 系统文件 ────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+*.icloud
+
+# ── 配置 / 密钥（不提交）────────────────────
+settings.json
+*.env
+*.secret
+.claude/
+
+# ── 本地文档（不提交）────────────────────────
+docs/
+
+# ── 编辑器 ────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── 日志 ──────────────────────────────────────
+*.log

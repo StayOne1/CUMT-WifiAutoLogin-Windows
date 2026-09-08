@@ -1,0 +1,60 @@
+CUMT 校园网自动登录工具 — Windows 版使用说明
+=============================================
+
+【环境要求】
+  - Windows 10 (1809+) / Windows 11
+  - uv（Python 环境与依赖由 uv 管理，无需单独安装 Python；
+    缺少解释器时 uv 会自动下载）
+
+  安装 uv（任选其一）：
+    winget install astral-sh.uv
+    或访问 https://docs.astral.sh/uv/getting-started/installation/
+
+【首次使用步骤】
+  1. 双击 run_win.bat
+     脚本会用 uv 自动同步依赖并启动程序
+  2. 点击任务栏托盘图标 -> ⚙️ 设置 -> 填入学号密码 -> 保存
+
+  或者手动运行：
+    uv sync
+    uv run win_login_app.py
+
+【功能说明】
+  - 自动登录：勾选后检测到掉线会自动重新登录
+  - 定时检测：每隔 N 分钟检测登录状态（默认 5 分钟，可调）
+  - 注销：退出当前校园网登录状态
+  - 注意：暂不支持开机自启
+
+【托盘图标颜色】
+  🟢 绿色 = 已登录 | 🔴 红色 = 未登录 | 🟡 黄色 = 检测/登录中
+  左键点击托盘图标可弹出菜单
+
+【配置文件位置】
+  %APPDATA%\CUMTAutoLogin\settings.json
+  （即 C:\Users\<用户名>\AppData\Roaming\CUMTAutoLogin\settings.json）
+  （学号、密码等设置保存在此，如需重置请删除该文件；
+    程序出错时的 error.log 也会生成在此目录）
+
+【注意事项】
+  1. 程序必须在连接校园网 Wi-Fi / 有线网络后才能登录
+  2. 密码以明文 JSON 形式存储在配置文件中，请注意安全
+  3. 不在上网时段或登录设备超限时会有相应提示
+  4. 如遇登录失败，请检查网络是否已连接到校园网
+  5. 如收不到系统通知，请检查 Windows 设置 -> 系统 -> 通知
+     中是否允许该应用发送通知（通知显示时长由系统管理）
+
+【运营商对应关系】
+  校园网 -> @xyw
+  中国电信 -> @telecom
+  中国移动 -> @cmcc
+  中国联通 -> @unicom
+
+【自行打包 exe（可选）】
+  uv add --dev pyinstaller
+  uv run python -m PyInstaller cumt_win.spec --noconfirm
+  产物：dist\CUMT校园网登录\CUMT校园网登录.exe
+  （整文件夹分发，双击 exe 即可运行，无需安装 Python 和 uv）
+
+=============================================
+项目源码：https://github.com/MuQY1818/CUMT_Net_Auto_Login
+Windows 版：由 macOS 版 (sjwty/CUMT-Campus-Login-Mac) 移植
