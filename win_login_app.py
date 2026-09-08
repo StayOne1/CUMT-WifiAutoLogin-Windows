@@ -662,10 +662,22 @@ def _install_excepthook() -> None:
     sys.excepthook = _hook
 
 
+def _app_icon_path() -> str:
+    """定位 app.ico：打包(onefile)时在解压资源目录，源码运行在仓库 assets/"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets", "app.ico")
+
+
 if __name__ == "__main__":
     _install_excepthook()
     app = CUMTApp(sys.argv)
     app.setApplicationName("CUMT校园网登录")
     app.setApplicationVersion(CURRENT_VERSION)
     app.setFont(QFont("Microsoft YaHei UI", 13))
+    _icon_path = _app_icon_path()
+    if os.path.exists(_icon_path):
+        app.setWindowIcon(QIcon(_icon_path))   # 任务栏/窗口图标
     sys.exit(app.exec())

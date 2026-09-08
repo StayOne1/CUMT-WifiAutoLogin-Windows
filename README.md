@@ -35,7 +35,7 @@ uv run win_login_app.py
 uv add --dev pyinstaller
 uv run python -m PyInstaller cumt_win.spec --noconfirm
 
-# 产物：dist/CUMT校园网登录/CUMT校园网登录.exe（整文件夹分发，双击即用）
+# 产物：dist/CUMT校园网登录.exe（单文件，依赖已全部打包，双击即用）
 ```
 
 ---

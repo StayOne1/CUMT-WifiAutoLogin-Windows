@@ -60,8 +60,9 @@ CUMT 校园网自动登录工具 — Windows 版使用说明
 【自行打包 exe（可选）】
   uv add --dev pyinstaller
   uv run python -m PyInstaller cumt_win.spec --noconfirm
-  产物：dist\CUMT校园网登录\CUMT校园网登录.exe
-  （整文件夹分发，双击 exe 即可运行，无需安装 Python 和 uv）
+  产物：dist\CUMT校园网登录.exe
+  （单文件 exe，依赖已全部打包，直接分发即可，双击运行，
+    无需安装 Python 和 uv；首次启动需解压依赖，会稍慢数秒）
 
 =============================================
 项目源码：https://github.com/MuQY1818/CUMT_Net_Auto_Login
