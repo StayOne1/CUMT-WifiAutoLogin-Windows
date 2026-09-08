@@ -20,10 +20,10 @@ CUMT 校园网自动登录工具 — Windows 版使用说明
     uv run win_login_app.py
 
 【功能说明】
+  - 开机自启：勾选后写入注册表 Run 键，开机静默运行（无需管理员权限）
   - 自动登录：勾选后检测到掉线会自动重新登录
   - 定时检测：每隔 N 分钟检测登录状态（默认 5 分钟，可调）
   - 注销：退出当前校园网登录状态
-  - 注意：暂不支持开机自启
 
 【托盘图标颜色】
   🟢 绿色 = 已登录 | 🔴 红色 = 未登录 | 🟡 黄色 = 检测/登录中
@@ -34,6 +34,14 @@ CUMT 校园网自动登录工具 — Windows 版使用说明
   （即 C:\Users\<用户名>\AppData\Roaming\CUMTAutoLogin\settings.json）
   （学号、密码等设置保存在此，如需重置请删除该文件；
     程序出错时的 error.log 也会生成在此目录）
+
+【开机自启位置】
+  注册表 HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
+  值名：CUMT校园网登录
+  （取消勾选设置中的「开机自启」即可移除；
+    打包 exe 运行时自启指向 exe 本身，源码运行时指向 .venv 中的 pythonw.exe；
+    注意：自启记录的是绝对路径，若移动了程序文件夹，
+    请在设置中取消再重新勾选一次「开机自启」）
 
 【注意事项】
   1. 程序必须在连接校园网 Wi-Fi / 有线网络后才能登录

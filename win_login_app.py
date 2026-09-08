@@ -4,7 +4,7 @@ CUMT 校园网自动登录 — Windows 托盘版 v1.0.0
 差异：
   · 配置路径改为 %APPDATA% 下的 CUMTAutoLogin 目录
   · 托盘左键手动弹出菜单；UI 字体/UA 适配 Windows
-  · 暂不支持开机自启（配置保留 autostart 字段）
+  · 开机自启：写入 HKCU 注册表 Run 键（无需管理员权限）
   · Python 3.9 兼容；Signal 驱动 worker，跨线程安全
 """
 
@@ -17,6 +17,7 @@ import json
 import re
 import ctypes
 import traceback
+import winreg
 from typing import Optional
 
 import requests
@@ -33,7 +34,7 @@ from PySide6.QtGui   import QIcon, QPainter, QColor, QFont, QPixmap, QAction, QC
 # ──────────────────────────────────────────────
 #  常量
 # ──────────────────────────────────────────────
-CURRENT_VERSION        = "v1.0.0-win"
+CURRENT_VERSION        = "v1.1.0-win"
 _APPDATA               = os.environ.get("APPDATA") or os.path.expanduser("~")
 CONFIG_PATH            = os.path.join(_APPDATA, "CUMTAutoLogin", "settings.json")
 DEFAULT_CHECK_INTERVAL = 5   # 分钟
@@ -76,6 +77,35 @@ def _dot_icon(color: str) -> QIcon:
 ICON_ONLINE:  Optional[QIcon] = None
 ICON_OFFLINE: Optional[QIcon] = None
 ICON_BUSY:    Optional[QIcon] = None
+
+# ──────────────────────────────────────────────
+#  Windows 开机自启（HKCU 注册表 Run 键，无需管理员权限）
+# ──────────────────────────────────────────────
+RUN_KEY_PATH   = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "CUMT校园网登录"
+
+def _autostart_command() -> str:
+    """自启命令：打包后指向 exe；源码运行指向 venv 的 pythonw.exe（无控制台窗口）"""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable          # 兜底：无 pythonw 时用 python.exe
+    return f'"{pythonw}" "{os.path.abspath(__file__)}"'
+
+def set_auto_start(enable: bool) -> None:
+    try:
+        if enable:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ,
+                                  _autostart_command())
+        else:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
+                                0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, RUN_VALUE_NAME)
+    except FileNotFoundError:
+        pass                              # 取消自启时值本就不存在，视为成功
 
 # ──────────────────────────────────────────────
 #  配置
@@ -345,8 +375,11 @@ class SettingsWindow(QMainWindow):
         _row("检测间隔", self.spin)
 
         crow = QHBoxLayout()
+        self.cb_autostart = CustomCheckBox("开机自启")
+        self.cb_autostart.setChecked(cfg.get("autostart", False))
         self.cb_autologin = CustomCheckBox("自动登录")
         self.cb_autologin.setChecked(cfg.get("auto_login", True))
+        crow.addWidget(self.cb_autostart)
         crow.addWidget(self.cb_autologin)
         crow.addStretch()
         cl.addLayout(crow)
@@ -380,6 +413,7 @@ class SettingsWindow(QMainWindow):
             "username":       self.id_edit.text().strip(),
             "password":       self.pw_edit.text(),
             "operator":       self.op_box.currentText(),
+            "autostart":      self.cb_autostart.isChecked(),
             "auto_login":     self.cb_autologin.isChecked(),
             "check_interval": self.spin.value(),
         })
@@ -572,6 +606,7 @@ class CUMTApp(QApplication):
             self._settings_win.spin.setValue(
                 self.cfg.get("check_interval", DEFAULT_CHECK_INTERVAL)
             )
+            self._settings_win.cb_autostart.setChecked(self.cfg.get("autostart", False))
             self._settings_win.cb_autologin.setChecked(self.cfg.get("auto_login", True))
 
         self._settings_win.show()
@@ -579,8 +614,9 @@ class CUMTApp(QApplication):
         self._settings_win.activateWindow()
 
     def _on_save(self, new_cfg: dict) -> None:
-        self.cfg = {**self.cfg, **new_cfg}   # new_cfg 无 autostart 键，合并保留原值
+        self.cfg = {**self.cfg, **new_cfg}
         save_config(self.cfg)
+        set_auto_start(self.cfg["autostart"])
         self._restart_timer()
         self.tray.showMessage(
             "设置已保存",
