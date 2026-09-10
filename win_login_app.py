@@ -1,11 +1,15 @@
 """
-CUMT 校园网自动登录 — Windows 托盘版 v1.0.0
+CUMT 校园网自动登录 — Windows 托盘版 v1.1.1
 由 macOS 版 v2.1.1 移植，网络逻辑与 Mac 版完全一致。
 差异：
   · 配置路径改为 %APPDATA% 下的 CUMTAutoLogin 目录
   · 托盘左键手动弹出菜单；UI 字体/UA 适配 Windows
   · 开机自启：写入 HKCU 注册表 Run 键（无需管理员权限）
   · Python 3.9 兼容；Signal 驱动 worker，跨线程安全
+v1.1.1 修复：
+  · 在线检测改为端到端外网探针，不再信任 Portal 状态页——
+    修复开机自启后"假绿灯"（显示已登录但外网不通）且不自动重连
+  · 启动阶段增加快速重试（500ms/5s/20s/60s），应对开机网络未就绪
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from PySide6.QtGui   import QIcon, QPainter, QColor, QFont, QPixmap, QAction, QC
 # ──────────────────────────────────────────────
 #  常量
 # ──────────────────────────────────────────────
-CURRENT_VERSION        = "v1.1.0-win"
+CURRENT_VERSION        = "v1.1.1-win"
 _APPDATA               = os.environ.get("APPDATA") or os.path.expanduser("~")
 CONFIG_PATH            = os.path.join(_APPDATA, "CUMTAutoLogin", "settings.json")
 DEFAULT_CHECK_INTERVAL = 5   # 分钟
@@ -153,36 +157,27 @@ class NetWorker(QObject):
         self.sig_logout.connect(self._do_logout)
 
     # ---------- 内部实现（运行在 worker 线程）----------
+    # 外网探针：只有拿到真实的端到端外网响应才认定在线。
+    # 不再把 Portal 页面的"注销/已登录"字样当作依据——eportal 状态与网关
+    # 放行可能脱同步（典型：开机后残留会话页，外网不通、认证后台无设备），
+    # 旧逻辑据此误报"已登录"且不再自动重连。登录接口幂等，误判为未登录
+    # 至多多登录一次，无害；误判为已登录则会假绿卡死。
+    _ONLINE_PROBES = (
+        # (url, 期望状态码, 响应必须包含的关键字; 关键字 None 表示只看状态码)
+        ("http://connect.rom.miui.com/generate_204", 204, None),
+        ("http://www.baidu.com", 200, "百度一下"),
+    )
+
     def _is_logged_in(self) -> bool:
-        # 1. 优先尝试访问外网（最真实的网络状态判定方式，避免 Portal 状态在注销后出现短暂延迟）
-        try:
-            r = self.session.get("http://www.baidu.com", timeout=3)
-            if r.status_code == 200 and "baidu" in r.text:
-                return True
-        except Exception:
-            pass
-
-        # 2. 如果外网不通，检查局域网 Portal 页面的标题和内容（区分未登录重定向页和登录成功后的状态页）
-        try:
-            r = self.session.get(PORTAL_URL, timeout=3)
-            r.encoding = r.apparent_encoding or "utf-8"
-            text = r.text
-            # 提取 HTML 标题
-            title_match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE)
-            if title_match:
-                title = title_match.group(1)
-                if "登录" in title or "认证" in title:
-                    return False
-                if "注销" in title:
+        for url, want_code, keyword in self._ONLINE_PROBES:
+            try:
+                r = self.session.get(url, timeout=3)
+                if r.status_code != want_code or PORTAL_HOST in r.url:
+                    continue          # 被重定向/劫持到 Portal 一律视为不在线
+                if keyword is None or keyword in r.text:
                     return True
-            # 备用匹配逻辑（如旧模板关键字）
-            if "type=\"password\"" in text or "user_password" in text:
-                return False
-            if any(k in text for k in ("已登录", "在线数量超过限制")):
-                return True
-        except Exception:
-            pass
-
+            except Exception:
+                pass
         return False
 
     def _do_check(self) -> None:
@@ -459,8 +454,10 @@ class CUMTApp(QApplication):
         self._check_timer.timeout.connect(self._timer_check)
         self._restart_timer()
 
-        # 启动时立即检测
-        QTimer.singleShot(500, self._timer_check)
+        # 启动阶段快速探测几轮：开机自启时无线连接/网络栈可能尚未就绪，
+        # 且此时 Portal 残留状态最易失真；快速重试以尽早完成真实认证
+        for _delay in (500, 5000, 20000, 60000):
+            QTimer.singleShot(_delay, self._timer_check)
 
     # ── 菜单 ──────────────────────────────────
     def _build_menu(self) -> None:
