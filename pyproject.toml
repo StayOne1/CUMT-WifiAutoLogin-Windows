@@ -1,6 +1,6 @@
 [project]
 name = "cumt-campus-login"
-version = "1.1.1"
+version = "1.2.0"
 description = "CUMT 校园网自动登录 — Windows 托盘版"
 readme = "README.md"
 requires-python = ">=3.9"

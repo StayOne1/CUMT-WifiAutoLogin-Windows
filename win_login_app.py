@@ -1,5 +1,5 @@
 """
-CUMT 校园网自动登录 — Windows 托盘版 v1.1.1
+CUMT 校园网自动登录 — Windows 托盘版 v1.2.0
 由 macOS 版 v2.1.1 移植，网络逻辑与 Mac 版完全一致。
 差异：
   · 配置路径改为 %APPDATA% 下的 CUMTAutoLogin 目录
@@ -10,6 +10,9 @@ v1.1.1 修复：
   · 在线检测改为端到端外网探针，不再信任 Portal 状态页——
     修复开机自启后"假绿灯"（显示已登录但外网不通）且不自动重连
   · 启动阶段增加快速重试（500ms/5s/20s/60s），应对开机网络未就绪
+v1.2.0 新增：
+  · 离线时自动搜索并连接校园 Wi-Fi CUMT_Stu（netsh 实现，
+    范围内自动切换/回连，无配置时自动创建开放网络配置文件）
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ import json
 import re
 import ctypes
 import traceback
+import subprocess
+import tempfile
 import winreg
 from typing import Optional
 
@@ -38,10 +43,12 @@ from PySide6.QtGui   import QIcon, QPainter, QColor, QFont, QPixmap, QAction, QC
 # ──────────────────────────────────────────────
 #  常量
 # ──────────────────────────────────────────────
-CURRENT_VERSION        = "v1.1.1-win"
+CURRENT_VERSION        = "v1.2.0-win"
 _APPDATA               = os.environ.get("APPDATA") or os.path.expanduser("~")
 CONFIG_PATH            = os.path.join(_APPDATA, "CUMTAutoLogin", "settings.json")
 DEFAULT_CHECK_INTERVAL = 5   # 分钟
+CAMPUS_SSID            = "CUMT_Stu"   # 校园 Wi-Fi，离线时自动连接
+WIFI_CONNECT_WAIT      = 15    # 秒，发起连接后等待关联完成的最长时间
 PORTAL_HOST            = "10.2.5.251"
 PORTAL_URL             = f"http://{PORTAL_HOST}/"
 WINDOWS_UA = (
@@ -135,6 +142,75 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 # ──────────────────────────────────────────────
+#  WLAN 管理（netsh 文本解析为纯函数，便于单元测试）
+#  说明：netsh 的字段标签随系统语言本地化，但 SSID/Profile 名等
+#  匹配目标均为 ASCII；解析只依赖 ASCII 字样与"SSID"/"所有用户
+#  配置文件"两种字段写法，中英文系统均可用。
+# ──────────────────────────────────────────────
+def _run_netsh(args: list) -> str:
+    """执行 netsh wlan 子命令并返回 stdout 文本，失败返回空串。
+
+    CREATE_NO_WINDOW：打包成 exe 后调用 netsh 不会闪黑色控制台窗口。
+    输出按字节接收、依次尝试 utf-8/gbk 解码——解析目标均为 ASCII，
+    个别字符解码失败不影响匹配。
+    """
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        p = subprocess.run(["netsh", "wlan", *args],
+                           capture_output=True, timeout=10, creationflags=flags)
+        out = p.stdout or b""
+        for enc in ("utf-8", "gbk"):
+            try:
+                return out.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return out.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _parse_wireless_ssid(netsh_interfaces_text: str) -> Optional[str]:
+    """从 `netsh wlan show interfaces` 输出解析当前连接的 SSID，未连接返回 None。
+
+    空白匹配用 [ \\t] 而非 \\s——\\s 会吞换行，导致断开状态下
+    "SSID :"（冒号后为空）跨行捕获下一行 BSSID 的值。
+    """
+    m = re.search(r"^[ \t]*SSID[ \t]*:[ \t]*(\S.*)$", netsh_interfaces_text, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _parse_profile_names(netsh_profiles_text: str) -> list:
+    """从 `netsh wlan show profiles` 输出解析全部配置文件名（中英文系统）"""
+    names = []
+    for m in re.finditer(r"(?:All User Profile|所有用户配置文件)\s*:\s*(\S.*)$",
+                         netsh_profiles_text, re.MULTILINE):
+        names.append(m.group(1).strip())
+    return names
+
+
+def _ssid_in_scan(netsh_networks_text: str) -> bool:
+    """判断 `netsh wlan show networks` 扫描结果中是否出现校园 SSID"""
+    return CAMPUS_SSID in netsh_networks_text
+
+
+def _open_profile_xml() -> str:
+    """开放网络（无二层密码，认证全部走 Portal）的 WLAN 配置文件 XML"""
+    return (
+        '<?xml version="1.0"?>\n'
+        '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+        f"  <name>{CAMPUS_SSID}</name>\n"
+        f"  <SSIDConfig><SSID><name>{CAMPUS_SSID}</name></SSID></SSIDConfig>\n"
+        "  <connectionType>ESS</connectionType>\n"
+        "  <connectionMode>auto</connectionMode>\n"
+        "  <MSM><security>\n"
+        "    <authEncryption><authentication>open</authentication>"
+        "<encryption>none</encryption><useOneX>false</useOneX></authEncryption>\n"
+        "  </security></MSM>\n"
+        "</WLANProfile>\n"
+    )
+
+
+# ──────────────────────────────────────────────
 #  网络 Worker（在独立 QThread 中运行）
 #  重要：所有方法通过 Signal → Slot 机制调用，不跨线程直接调用
 # ──────────────────────────────────────────────
@@ -180,11 +256,64 @@ class NetWorker(QObject):
                 pass
         return False
 
+    # ---------- 校园 Wi-Fi 管理（仅离线时被调用） ----------
+    def _current_wifi_ssid(self) -> Optional[str]:
+        return _parse_wireless_ssid(_run_netsh(["show", "interfaces"]))
+
+    def _ensure_campus_wifi(self) -> bool:
+        """确保已连接校园 Wi-Fi（CAMPUS_SSID），返回是否成功。
+
+        - 当前已在该 SSID 上：直接 True（一次查询，开销极小）
+        - 不在信号范围（如在家/校外）：False，绝不动用户的网络
+        - 在范围内但未连接/连接了别的：发起连接并轮询等待关联完成
+        - 无线网卡不存在等任何异常：False，按原流程继续（不影响登录）
+        """
+        try:
+            if self._current_wifi_ssid() == CAMPUS_SSID:
+                return True
+
+            if not _ssid_in_scan(_run_netsh(["show", "networks"])):
+                return False
+
+            names = _parse_profile_names(_run_netsh(["show", "profiles"]))
+            profile = CAMPUS_SSID if CAMPUS_SSID in names else self._add_open_profile()
+            if not profile:
+                return False
+
+            _run_netsh(["connect", f"name={profile}", f"ssid={CAMPUS_SSID}"])
+
+            deadline = time.time() + WIFI_CONNECT_WAIT
+            while time.time() < deadline:
+                if self._current_wifi_ssid() == CAMPUS_SSID:
+                    return True
+                time.sleep(1)
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _add_open_profile() -> Optional[str]:
+        """为开放网络创建用户级 WLAN 配置文件（无需管理员），失败返回 None"""
+        try:
+            fd, path = tempfile.mkstemp(suffix=".xml", prefix="cumt_wlan_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(_open_profile_xml())
+                _run_netsh(["add", "profile", f"filename={path}", "user=current"])
+            finally:
+                os.remove(path)
+            return CAMPUS_SSID
+        except Exception:
+            return None
+
     def _do_check(self) -> None:
         logged = self._is_logged_in()
+        if not logged and self._ensure_campus_wifi():
+            logged = self._is_logged_in()   # Wi-Fi 刚接好，复探一次外网
         self.status.emit(logged)
 
     def _do_login(self, username: str, password: str, operator: str) -> None:
+        self._ensure_campus_wifi()   # 认证前确保 Wi-Fi 就绪（已连接时开销极小）
         full = username + OPERATOR_SUFFIX.get(operator, "@xyw")
         ts   = int(time.time() * 1000)
         cb   = f"dr{ts}"
