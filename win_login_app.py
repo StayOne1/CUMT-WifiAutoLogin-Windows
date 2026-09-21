@@ -1,5 +1,5 @@
 """
-CUMT 校园网自动登录 — Windows 托盘版 v1.2.0
+CUMT 校园网自动登录 — Windows 托盘版 v1.3.0
 由 macOS 版 v2.1.1 移植，网络逻辑与 Mac 版完全一致。
 差异：
   · 配置路径改为 %APPDATA% 下的 CUMTAutoLogin 目录
@@ -13,6 +13,10 @@ v1.1.1 修复：
 v1.2.0 新增：
   · 离线时自动搜索并连接校园 Wi-Fi CUMT_Stu（netsh 实现，
     范围内自动切换/回连，无配置时自动创建开放网络配置文件）
+v1.3.0 新增：
+  · 备用 Wi-Fi 故障转移：设置页可扫描/手输备用 SSID 并保存密码，
+    CUMT_Stu 关联失败或认证后仍无外网时自动切换到备用网络；
+    惰性驻留——备用可用期间不主动切回校园网，断网才重走完整流程
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import subprocess
 import tempfile
 import winreg
 from typing import Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 import requests
 
@@ -43,7 +48,7 @@ from PySide6.QtGui   import QIcon, QPainter, QColor, QFont, QPixmap, QAction, QC
 # ──────────────────────────────────────────────
 #  常量
 # ──────────────────────────────────────────────
-CURRENT_VERSION        = "v1.2.0-win"
+CURRENT_VERSION        = "v1.3.0-win"
 _APPDATA               = os.environ.get("APPDATA") or os.path.expanduser("~")
 CONFIG_PATH            = os.path.join(_APPDATA, "CUMTAutoLogin", "settings.json")
 DEFAULT_CHECK_INTERVAL = 5   # 分钟
@@ -125,6 +130,7 @@ DEFAULT_CFG: dict = {
     "username": "", "password": "", "operator": "校园网",
     "autostart": False, "auto_login": True,
     "check_interval": DEFAULT_CHECK_INTERVAL,
+    "backup_ssid": "", "backup_password": "",
 }
 
 def load_config() -> dict:
@@ -145,7 +151,7 @@ def save_config(cfg: dict) -> None:
 #  WLAN 管理（netsh 文本解析为纯函数，便于单元测试）
 #  说明：netsh 的字段标签随系统语言本地化，但 SSID/Profile 名等
 #  匹配目标均为 ASCII；解析只依赖 ASCII 字样与"SSID"/"所有用户
-#  配置文件"两种字段写法，中英文系统均可用。
+#  配置文件"/"身份验证"等字段写法，中英文系统均可用。
 # ──────────────────────────────────────────────
 def _run_netsh(args: list) -> str:
     """执行 netsh wlan 子命令并返回 stdout 文本，失败返回空串。
@@ -188,23 +194,73 @@ def _parse_profile_names(netsh_profiles_text: str) -> list:
     return names
 
 
-def _ssid_in_scan(netsh_networks_text: str) -> bool:
-    """判断 `netsh wlan show networks` 扫描结果中是否出现校园 SSID"""
-    return CAMPUS_SSID in netsh_networks_text
+def _parse_scan_networks(netsh_networks_text: str) -> list:
+    """解析 `netsh wlan show networks` 扫描结果，返回 [(ssid, auth), ...]。
+
+    头行形如 "SSID 3 : 名称"——行首锚定 + 编号，BSSID 行不会误匹配；
+    auth 取该 SSID 块内的"身份验证/身份鉴别/Authentication"行，缺省空串。
+    供精确匹配（子串匹配会让 CUMT_Stu_5G 误命中 CUMT_Stu）。
+    """
+    auth_re = re.compile(r"(?:身份验证|身份鉴别|Authentication)[ \t]*:[ \t]*(.+)$",
+                         re.MULTILINE)
+    heads = list(re.finditer(r"^[ \t]*SSID[ \t]+\d+[ \t]*:[ \t]*(.*)$",
+                             netsh_networks_text, re.MULTILINE))
+    nets = []
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(netsh_networks_text)
+        am = auth_re.search(netsh_networks_text, m.end(), end)
+        nets.append((m.group(1).strip(), am.group(1).strip() if am else ""))
+    return nets
 
 
-def _open_profile_xml() -> str:
-    """开放网络（无二层密码，认证全部走 Portal）的 WLAN 配置文件 XML"""
+def _auth_kind(auth_str: str) -> str:
+    """netsh 身份验证字段 → open / psk2 / sae3 / enterprise（中英文系统）。
+
+    - WPA2/WPA3 过渡网络（"WPA2/WPA3-个人"）归 psk2：WPA2PSK profile 可连
+    - 中文系统的 WPA3 显示为"WPA3-个人"，不含 SAE 字样，判据须按版本号
+    - 企业级为 802.1X，密码 profile 连不上，调用方需拒绝
+    """
+    s = (auth_str or "").lower()
+    if not s or "开放" in s or "open" in s:
+        return "open"
+    if "企业" in s or "enterprise" in s:
+        return "enterprise"
+    if "wpa3" in s and "wpa2" not in s:
+        return "sae3"
+    return "psk2"
+
+
+def _wlan_profile_xml(ssid: str, password: Optional[str] = None,
+                      sae: bool = False) -> str:
+    """WLAN 配置文件 XML：无密码为开放网络（认证全走 Portal），
+    有密码为 WPA2PSK/WPA3SAE 个人级 AES。
+
+    SSID 与密码均做 XML 转义（防 AT&T 之类名称拼出非法 XML）；
+    声明带 UTF-8 以支持中文 SSID（临时文件按 UTF-8 无 BOM 写出）。
+    """
+    esc = _xml_escape(ssid)
+    if not password:
+        security = (
+            "    <authEncryption><authentication>open</authentication>"
+            "<encryption>none</encryption><useOneX>false</useOneX></authEncryption>\n"
+        )
+    else:
+        auth = "WPA3SAE" if sae else "WPA2PSK"
+        security = (
+            f"    <authEncryption><authentication>{auth}</authentication>"
+            "<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>\n"
+            "    <sharedKey><keyType>passPhrase</keyType><protected>false</protected>"
+            f"<keyMaterial>{_xml_escape(password)}</keyMaterial></sharedKey>\n"
+        )
     return (
-        '<?xml version="1.0"?>\n'
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
-        f"  <name>{CAMPUS_SSID}</name>\n"
-        f"  <SSIDConfig><SSID><name>{CAMPUS_SSID}</name></SSID></SSIDConfig>\n"
+        f"  <name>{esc}</name>\n"
+        f"  <SSIDConfig><SSID><name>{esc}</name></SSID></SSIDConfig>\n"
         "  <connectionType>ESS</connectionType>\n"
         "  <connectionMode>auto</connectionMode>\n"
         "  <MSM><security>\n"
-        "    <authEncryption><authentication>open</authentication>"
-        "<encryption>none</encryption><useOneX>false</useOneX></authEncryption>\n"
+        f"{security}"
         "  </security></MSM>\n"
         "</WLANProfile>\n"
     )
@@ -219,18 +275,25 @@ class NetWorker(QObject):
     sig_check  = Signal()
     sig_login  = Signal(str, str, str)   # username, password, operator
     sig_logout = Signal()
+    sig_scan   = Signal()                # 扫描周围 Wi-Fi（设置页选取备用网络用）
+    sig_set_backup = Signal(str, str)    # 更新备用 Wi-Fi 凭据 (ssid, password)
 
     # 下行 Signal（Worker → 主线程）
     status = Signal(bool)        # True=已登录
     result = Signal(str, str)    # (action, message)
+    scan_result = Signal(list)   # 扫描到的 SSID 列表
 
-    def __init__(self) -> None:
+    def __init__(self, backup_ssid: str = "", backup_password: str = "") -> None:
         super().__init__()
         self.session = requests.Session()
+        self.backup_ssid = backup_ssid
+        self.backup_password = backup_password
         # 连接上行信号到对应槽（在 worker 所在线程执行）
         self.sig_check.connect(self._do_check)
         self.sig_login.connect(self._do_login)
         self.sig_logout.connect(self._do_logout)
+        self.sig_scan.connect(self._do_scan)
+        self.sig_set_backup.connect(self._set_backup)
 
     # ---------- 内部实现（运行在 worker 线程）----------
     # 外网探针：只有拿到真实的端到端外网响应才认定在线。
@@ -256,60 +319,109 @@ class NetWorker(QObject):
                 pass
         return False
 
-    # ---------- 校园 Wi-Fi 管理（仅离线时被调用） ----------
+    # ---------- Wi-Fi 管理（校园网/备用网共用同一连接逻辑） ----------
     def _current_wifi_ssid(self) -> Optional[str]:
         return _parse_wireless_ssid(_run_netsh(["show", "interfaces"]))
 
-    def _ensure_campus_wifi(self) -> bool:
-        """确保已连接校园 Wi-Fi（CAMPUS_SSID），返回是否成功。
+    def _connect_wifi(self, ssid: str, password: Optional[str] = None,
+                      refresh: bool = False) -> bool:
+        """连接指定 Wi-Fi，成功关联返回 True。
 
-        - 当前已在该 SSID 上：直接 True（一次查询，开销极小）
-        - 不在信号范围（如在家/校外）：False，绝不动用户的网络
-        - 在范围内但未连接/连接了别的：发起连接并轮询等待关联完成
-        - 无线网卡不存在等任何异常：False，按原流程继续（不影响登录）
+        - 已在该 SSID 上：直接 True（一次查询，开销极小；惰性驻留
+          备用网在线时零成本，也不重置会话）
+        - 不在信号范围（如在家/校外）或为企业级 802.1X：False，
+          绝不动用户的网络
+        - refresh=False：profile 存在即复用，不存在才创建（校园网
+          开放网络，配置永不变化，与旧版行为一致）
+        - refresh=True：先删旧 profile 再重建（备用网密码可能已在
+          设置中变更，以设置为准）
+        - 关联成功后重置 requests 会话：网络栈已切换，连接池里旧网
+          的 keep-alive 死连接会让随后的探针/登录请求误报失败
+        - 无线网卡不存在等任何异常：False，按原流程继续
         """
         try:
-            if self._current_wifi_ssid() == CAMPUS_SSID:
+            if self._current_wifi_ssid() == ssid:
                 return True
 
-            if not _ssid_in_scan(_run_netsh(["show", "networks"])):
+            nets = dict(_parse_scan_networks(_run_netsh(["show", "networks"])))
+            if ssid not in nets or _auth_kind(nets[ssid]) == "enterprise":
                 return False
 
-            names = _parse_profile_names(_run_netsh(["show", "profiles"]))
-            profile = CAMPUS_SSID if CAMPUS_SSID in names else self._add_open_profile()
-            if not profile:
-                return False
+            if refresh:
+                _run_netsh(["delete", "profile", f"name={ssid}"])
+            if refresh or ssid not in _parse_profile_names(_run_netsh(["show", "profiles"])):
+                if not self._add_profile(ssid, password,
+                                         _auth_kind(nets[ssid]) == "sae3"):
+                    return False
 
-            _run_netsh(["connect", f"name={profile}", f"ssid={CAMPUS_SSID}"])
+            _run_netsh(["connect", f"name={ssid}", f"ssid={ssid}"])
 
             deadline = time.time() + WIFI_CONNECT_WAIT
-            while time.time() < deadline:
-                if self._current_wifi_ssid() == CAMPUS_SSID:
+            while True:
+                if self._current_wifi_ssid() == ssid:
+                    self.session = requests.Session()
                     return True
+                if time.time() >= deadline:
+                    return False
                 time.sleep(1)
-            return False
         except Exception:
             return False
 
+    def _ensure_campus_wifi(self) -> bool:
+        """确保已连接校园 Wi-Fi（CAMPUS_SSID）：开放网络、profile 缺失才创建"""
+        return self._connect_wifi(CAMPUS_SSID)
+
     @staticmethod
-    def _add_open_profile() -> Optional[str]:
-        """为开放网络创建用户级 WLAN 配置文件（无需管理员），失败返回 None"""
+    def _add_profile(ssid: str, password: Optional[str], sae: bool) -> Optional[str]:
+        """创建用户级 WLAN 配置文件（无需管理员），失败返回 None"""
         try:
             fd, path = tempfile.mkstemp(suffix=".xml", prefix="cumt_wlan_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(_open_profile_xml())
+                    f.write(_wlan_profile_xml(ssid, password, sae))
                 _run_netsh(["add", "profile", f"filename={path}", "user=current"])
             finally:
                 os.remove(path)
-            return CAMPUS_SSID
+            return ssid
         except Exception:
             return None
 
+    # ---------- 备用 Wi-Fi（校园网不可用时的故障转移） ----------
+    def _set_backup(self, ssid: str, password: str) -> None:
+        self.backup_ssid, self.backup_password = ssid, password
+
+    def _do_scan(self) -> None:
+        nets = _parse_scan_networks(_run_netsh(["show", "networks"]))
+        self.scan_result.emit([s for s, _auth in nets])
+
+    def _try_backup_wifi(self) -> bool:
+        """切换到备用 Wi-Fi；连接成功且外网复探在线才返回 True。
+
+        仅在真实发生切换并确认在线时 emit result("wifi", ssid)——
+        驻留备用网在线时 _do_check 首行探针即为 True，走不到这里，
+        结构上保证不会每个检测周期重复通知。未配置备用（SSID 为
+        空）时零开销直接 False。
+        """
+        if not self.backup_ssid:
+            return False
+        if not self._connect_wifi(self.backup_ssid, self.backup_password, refresh=True):
+            return False
+        if not self._is_logged_in():
+            return False
+        self.result.emit("wifi", self.backup_ssid)
+        return True
+
     def _do_check(self) -> None:
         logged = self._is_logged_in()
-        if not logged and self._ensure_campus_wifi():
-            logged = self._is_logged_in()   # Wi-Fi 刚接好，复探一次外网
+        if not logged:
+            if self._ensure_campus_wifi():
+                logged = self._is_logged_in()   # Wi-Fi 刚接好，复探一次外网
+            else:
+                # 仅在校园网"关联失败"（不在范围/连不上）时才切备用；
+                # 连上了但不通走主线程自动登录 → _do_login 尾部兜底，
+                # 不能在这里抢先切网，否则 Portal 认证这条正常补救
+                # 路径会被绕过
+                logged = self._try_backup_wifi()
         self.status.emit(logged)
 
     def _do_login(self, username: str, password: str, operator: str) -> None:
@@ -356,9 +468,18 @@ class NetWorker(QObject):
         if login_success:
             self.status.emit(True)
         else:
-            self.status.emit(self._is_logged_in())
+            logged = self._is_logged_in()
+            if not logged:
+                # 认证失败/接口异常/外网仍不通：兜底切备用 Wi-Fi
+                logged = self._try_backup_wifi()
+            self.status.emit(logged)
 
     def _do_logout(self) -> None:
+        # 已驻留备用 Wi-Fi 时校园认证本就未生效，短路避免对 Portal 白等超时。
+        # 不能用 "SSID != CAMPUS_SSID" 判断——会误伤有线接校园网的用户
+        if self.backup_ssid and self._current_wifi_ssid() == self.backup_ssid:
+            self.result.emit("logout", "not_logged_in")
+            return
         if not self._is_logged_in():
             self.result.emit("logout", "not_logged_in")
             return
@@ -435,11 +556,12 @@ class CustomCheckBox(QCheckBox):
 # ──────────────────────────────────────────────
 class SettingsWindow(QMainWindow):
     save_requested = Signal(dict)
+    scan_requested = Signal()      # 请求扫描周围 Wi-Fi（由 App 转发到 worker 线程）
 
     def __init__(self, cfg: dict, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("CUMT 校园网登录 — 设置")
-        self.setFixedSize(400, 430)
+        self.setFixedSize(400, 545)
         self.setWindowFlags(Qt.WindowType.Window)
 
         root = QWidget()
@@ -510,6 +632,47 @@ class SettingsWindow(QMainWindow):
 
         lay.addWidget(card)
 
+        # 备用 Wi-Fi：校园网不可用时自动切换的兜底网络
+        bak_card = QFrame()
+        bak_card.setStyleSheet("QFrame{background:white;border-radius:12px;}")
+        bcl = QVBoxLayout(bak_card)
+        bcl.setSpacing(10); bcl.setContentsMargins(16, 16, 16, 16)
+
+        bak_title = QLabel("📶  备用 Wi-Fi")
+        bak_title.setStyleSheet("font-size:14px; font-weight:bold; color:#1d1d1f;")
+        bcl.addWidget(bak_title)
+        bak_hint = QLabel("校园网连不上或认证失败时自动切换；备用可用期间不主动切回")
+        bak_hint.setStyleSheet("color:#999; font-size:11px;")
+        bak_hint.setWordWrap(True)
+        bcl.addWidget(bak_hint)
+
+        srow = QHBoxLayout(); srow.setSpacing(8)
+        self.ssid_box = QComboBox()
+        self.ssid_box.setEditable(True)      # 允许手动输入（信号当前不在范围内也能配置）
+        self.ssid_box.setEditText(cfg.get("backup_ssid", ""))
+        self.ssid_box.lineEdit().setPlaceholderText("扫描选择或手动输入 SSID")
+        self.ssid_box.setStyleSheet(fstyle)
+        self.scan_btn = QPushButton("扫描")
+        self.scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scan_btn.setStyleSheet(
+            "QPushButton{background:#4CAF50;color:white;border:none;border-radius:7px;"
+            "padding:7px 14px;font-size:13px;}"
+            "QPushButton:hover{background:#43A047;}"
+            "QPushButton:disabled{background:#a5d6a7;}"
+        )
+        self.scan_btn.clicked.connect(self._scan)
+        srow.addWidget(self.ssid_box, 1)
+        srow.addWidget(self.scan_btn)
+        bcl.addLayout(srow)
+
+        self.bak_pw_edit = QLineEdit(cfg.get("backup_password", ""))
+        self.bak_pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.bak_pw_edit.setPlaceholderText("备用 Wi-Fi 密码（开放网络留空）")
+        self.bak_pw_edit.setStyleSheet(fstyle)
+        bcl.addWidget(self.bak_pw_edit)
+
+        lay.addWidget(bak_card)
+
         brow = QHBoxLayout(); brow.setSpacing(10)
         cancel = QPushButton("取消")
         cancel.setStyleSheet(
@@ -532,6 +695,21 @@ class SettingsWindow(QMainWindow):
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(ver)
 
+    def _scan(self) -> None:
+        """请求 App 转发到 worker 线程执行 netsh 扫描（避免 UI 卡顿）"""
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("扫描中...")
+        self.scan_requested.emit()
+
+    def fill_networks(self, ssids: list) -> None:
+        """扫描结果到达：填充下拉框，保留用户已输入的文本"""
+        cur = self.ssid_box.currentText()
+        self.ssid_box.clear()
+        self.ssid_box.addItems(ssids)
+        self.ssid_box.setEditText(cur)
+        self.scan_btn.setEnabled(True)
+        self.scan_btn.setText("扫描")
+
     def _save(self) -> None:
         self.save_requested.emit({
             "username":       self.id_edit.text().strip(),
@@ -540,6 +718,8 @@ class SettingsWindow(QMainWindow):
             "autostart":      self.cb_autostart.isChecked(),
             "auto_login":     self.cb_autologin.isChecked(),
             "check_interval": self.spin.value(),
+            "backup_ssid":    self.ssid_box.currentText().strip(),
+            "backup_password": self.bak_pw_edit.text(),
         })
         self.hide()
 
@@ -560,12 +740,14 @@ class CUMTApp(QApplication):
         self.cfg = load_config()
         self.logged_in = False
 
-        # Worker 线程
+        # Worker 线程（构造期注入备用 Wi-Fi 凭据，早于线程启动无竞态）
         self._thread = QThread()
-        self._worker = NetWorker()
+        self._worker = NetWorker(self.cfg.get("backup_ssid", ""),
+                                 self.cfg.get("backup_password", ""))
         self._worker.moveToThread(self._thread)
         self._worker.status.connect(self._on_status)
         self._worker.result.connect(self._on_result)
+        self._worker.scan_result.connect(self._on_scan_result)
         self._thread.start()
 
         # 系统托盘
@@ -718,12 +900,28 @@ class CUMTApp(QApplication):
                     "注销失败", detail,
                     QSystemTrayIcon.MessageIcon.Warning, 3000,
                 )
+        elif action == "wifi":
+            # msg 为备用 Wi-Fi 的 SSID；仅真实切换并确认在线时才会到达
+            self.tray.showMessage(
+                "已切换备用 Wi-Fi", f"校园网不可用，已连接 {msg}",
+                QSystemTrayIcon.MessageIcon.Information, 4000,
+            )
+
+    # ── Wi-Fi 扫描（设置页备用网络选取）────────
+    def _on_scan_requested(self) -> None:
+        self._worker.sig_scan.emit()
+
+    def _on_scan_result(self, ssids: list) -> None:
+        # 窗口未创建则丢弃；窗口仅 hide 不销毁，存活期内填充安全
+        if self._settings_win is not None:
+            self._settings_win.fill_networks(ssids)
 
     # ── 设置窗口 ──────────────────────────────
     def _open_settings(self) -> None:
         if self._settings_win is None:
             self._settings_win = SettingsWindow(self.cfg)
             self._settings_win.save_requested.connect(self._on_save)
+            self._settings_win.scan_requested.connect(self._on_scan_requested)
         else:
             # 同步最新配置到窗口
             self._settings_win.id_edit.setText(self.cfg.get("username", ""))
@@ -734,6 +932,8 @@ class CUMTApp(QApplication):
             )
             self._settings_win.cb_autostart.setChecked(self.cfg.get("autostart", False))
             self._settings_win.cb_autologin.setChecked(self.cfg.get("auto_login", True))
+            self._settings_win.ssid_box.setEditText(self.cfg.get("backup_ssid", ""))
+            self._settings_win.bak_pw_edit.setText(self.cfg.get("backup_password", ""))
 
         self._settings_win.show()
         self._settings_win.raise_()
@@ -744,6 +944,9 @@ class CUMTApp(QApplication):
         save_config(self.cfg)
         set_auto_start(self.cfg["autostart"])
         self._restart_timer()
+        # 推送备用 Wi-Fi 凭据到 worker 线程（后续故障转移即用新值）
+        self._worker.sig_set_backup.emit(
+            self.cfg.get("backup_ssid", ""), self.cfg.get("backup_password", ""))
         self.tray.showMessage(
             "设置已保存",
             f"检测间隔：每 {self.cfg['check_interval']} 分钟",
